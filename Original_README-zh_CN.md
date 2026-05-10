@@ -59,7 +59,7 @@
 
 #### 图形界面
 
-运行`MagiaTimeline-GUI.py`打开实验性图形界面。目前只支持默认的`dtd`策略组。
+运行`MagiaTimeline-GUI.bat`（Windows）或`MagiaTimeline-GUI.sh`（GNU/Linux或macOS），通过项目虚拟环境打开实验性图形界面。目前只支持默认的`dtd`策略组。
 
 ## 概念讲解
 

@@ -33,6 +33,14 @@ from Util import *
 
 from Version import VERSION
 
+def resolveOutputFormat(config: dict) -> str:
+    outputFormat = config.get("outputFormat")
+    if outputFormat is not None:
+        if outputFormat not in ("ass", "srt", "both"):
+            raise ValueError("outputFormat must be 'ass', 'srt', or 'both'")
+        return outputFormat
+    return "both" if config.get("outputSrt", False) else "ass"
+
 def cli():
     parser = argparse.ArgumentParser(
         description=f"MagiaTimeline {VERSION} - https://github.com/HurryPeng/MagiaTimeline",
@@ -65,6 +73,7 @@ def main(config: dict, schema: dict, tempDirPath: typing.Optional[str] = None):
             raise Exception("No config found for engine \"" + config["engine"] + "\"")
     strategyConfig = config[config["strategy"]][config["preset"]]
     engineConfig = config[config["engine"]]
+    outputFormat = resolveOutputFormat(config)
 
     cv.ocl.setUseOpenCL(config["enableOpenCL"])
 
@@ -96,8 +105,10 @@ def main(config: dict, schema: dict, tempDirPath: typing.Optional[str] = None):
         timeBase: fractions.Fraction = srcStream.time_base
         fps: fractions.Fraction = srcStream.average_rate
 
-        with open(config["assTemplate"], "r", encoding="utf-8") as templateAsst:
-            asstStr: str = templateAsst.read()
+        asstStr: str = ""
+        if outputFormat in ("ass", "both"):
+            with open(config["assTemplate"], "r", encoding="utf-8") as templateAsst:
+                asstStr = templateAsst.read()
 
         contentRect = RatioRectangle(SrcRectangle(*size), *config["contentRect"])
         print(f"Resolution: {size[0]}x{size[1]}" + (f" (scaled down by {scaleDown})" if scaleDown > 1 else ""))
@@ -171,18 +182,19 @@ def main(config: dict, schema: dict, tempDirPath: typing.Optional[str] = None):
                     iirStyleClassifyPass = IIRStyleClassifyPass(config["sty"], strategy.getExtraJobFrameKey())
                     iirStyleClassifyPass.apply(iir)
 
-        print("==== IIR to ASS ====")
-        assStr: str = asstStr.format(
-            playResX = originalSize[0],
-            playResY = originalSize[1],
-            styles = "".join(iir.stylesStr()),
-            events = iir.assEventsStr()
-        )
-        with open(dst + ".ass", "w", encoding="utf-8") as dstAss:
-            dstAss.write(assStr)
-        print("Result written to", dst + ".ass")
+        if outputFormat in ("ass", "both"):
+            print("==== IIR to ASS ====")
+            assStr = asstStr.format(
+                playResX = originalSize[0],
+                playResY = originalSize[1],
+                styles = "".join(iir.stylesStr()),
+                events = iir.assEventsStr()
+            )
+            with open(dst + ".ass", "w", encoding="utf-8") as dstAss:
+                dstAss.write(assStr)
+            print("Result written to", dst + ".ass")
 
-        if config["outputSrt"]:
+        if outputFormat in ("srt", "both"):
             print("==== IIR to SRT ====")
             with open(dst + ".srt", "w", encoding="utf-8") as dstSrt:
                 dstSrt.write(iir.srtEventStr())
