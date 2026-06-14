@@ -1,6 +1,5 @@
-.vscode
-.claude
 __pycache__
+.pytest_cache/
 /*Output*.*
 *.csv
 .env
@@ -9,11 +8,5 @@ debug*
 !/requirements.txt
 /venv/
 /PaddleOCRModels*
-/build/
-/dist/
 /*debug*/
-/note
-/docs/superpowers/
 Original_README-en.md
-/dtdDebug/
-/experiments/

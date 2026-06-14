@@ -15,17 +15,8 @@ import yaml
 import tempfile
 import traceback
 import queue
-import copy
-import pathlib
 
 from Version import VERSION
-from VideoPreprocess import (
-    VideoPreprocessPaths,
-    build_reencode_command,
-    build_remux_command,
-    detect_h264_encoder,
-    run_ffmpeg,
-)
 
 # Initialize appearance
 customtkinter.set_appearance_mode("Dark")  # Modes: System, Dark, Light
@@ -48,14 +39,7 @@ class VideoPlayer:
         assert self.stream.average_rate is not None
         self.fps: fractions.Fraction = self.stream.average_rate
         # Duration (in seconds)
-        if self.frames:
-            self.duration = float(self.frames) / float(self.fps)
-        elif self.stream.duration is not None:
-            self.duration = float(self.stream.duration * self.timeBase)
-        elif self.container.duration is not None:
-            self.duration = float(self.container.duration) / 1_000_000
-        else:
-            self.duration = 0.0
+        self.duration = float(self.frames) / float(self.fps)
 
     def getFrameAt(self, seconds: float):
         """Seek to the nearest keyframe before seconds and decode next frame."""
@@ -206,12 +190,10 @@ class MagiaTimelineGUI(customtkinter.CTk):
         # Checkbox: Enable Text Extraction
         self.checkboxTextExtraction = customtkinter.CTkCheckBox(self.rightFrame, text="Enable Text Extraction")
         self.checkboxTextExtraction.grid(row=1, column=0, sticky="ew", padx=5, pady=(0,10))
-        self.checkboxTextExtraction.grid_remove()
 
         # Checkbox: Enable Style Classification
         self.checkboxStyleClassify = customtkinter.CTkCheckBox(self.rightFrame, text="Enable Style Classification")
         self.checkboxStyleClassify.grid(row=2, column=0, sticky="ew", padx=5, pady=(0,10))
-        self.checkboxStyleClassify.grid_remove()
 
         # Checkbox: Enable Typewriter Subtitle Support
         self.checkboxTypewriter = customtkinter.CTkCheckBox(self.rightFrame, text="Enable Typewriter Subtitle Support")
@@ -220,7 +202,6 @@ class MagiaTimelineGUI(customtkinter.CTk):
         # Checkbox: Enable Additional SRT Output
         self.checkboxOutputSrt = customtkinter.CTkCheckBox(self.rightFrame, text="Enable Additional SRT Output")
         self.checkboxOutputSrt.grid(row=4, column=0, sticky="ew", padx=5, pady=(0,10))
-        self.checkboxOutputSrt.grid_remove()
 
         # Progress bar
         self.progressBar = customtkinter.CTkProgressBar(self.rightFrame, mode="determinate")
@@ -265,7 +246,7 @@ class MagiaTimelineGUI(customtkinter.CTk):
         self.textbox.configure(state="disabled")
 
     def openVideo(self):
-        filePath = filedialog.askopenfilename(filetypes=[("Video Files", "*.mp4 *.mkv *.webm")])
+        filePath = filedialog.askopenfilename(filetypes=[("Video Files", "*.mp4")])
         if filePath:
             self.player = VideoPlayer(filePath)
             self.sliderTime.configure(to=self.player.duration, state="normal")
@@ -408,79 +389,15 @@ class MagiaTimelineGUI(customtkinter.CTk):
         self.canvas.configure(cursor=self.HANDLE_CURSORS.get(mode, "") if mode else "")
 
     @staticmethod
-    def runTimelineAttempt(config: dict, schema: dict, tempDirPath: str) -> typing.Optional[str]:
-        try:
-            import MagiaTimeline
-            MagiaTimeline.main(config, schema, tempDirPath)
-            return None
-        except Exception:
-            return traceback.format_exc()
-
-    @staticmethod
-    def processWorker(queue, config: dict, schema: dict, tempDirPath: str):
+    def processWorker(queue, *args, **kwargs):
         sys.stdout = sys.stderr = QueueWriter(queue)
         try:
-            from Util import autoNumberedNaming
-
-            originalConfig = copy.deepcopy(config)
-            originalSource = pathlib.Path(originalConfig["source"][0])
-            originalDestination = originalConfig["destination"][0]
-            if originalDestination == "...":
-                originalDestination = autoNumberedNaming(str(originalSource))
-            originalConfig["destination"] = [originalDestination]
-
-            print("[Info] Attempt 1/3: processing original video.")
-            failure = MagiaTimelineGUI.runTimelineAttempt(originalConfig, schema, tempDirPath)
-            if failure is None:
-                print("[Info] MagiaTimeline worker process finished successfully.")
-                return
-            print("[Error] Original video processing failed:\n" + failure)
-
-            paths = VideoPreprocessPaths.from_source(originalSource, pathlib.Path(tempDirPath))
-
-            print("[Info] Attempt 2/3: remuxing video with regenerated timestamps.")
-            remuxCommand = build_remux_command(str(originalSource), str(paths.remuxed))
-            remuxResult = run_ffmpeg(remuxCommand)
-            if remuxResult.returncode == 0:
-                remuxConfig = copy.deepcopy(originalConfig)
-                remuxConfig["source"] = [str(paths.remuxed)]
-                print(f"[Info] Remuxed video written to {paths.remuxed}")
-                failure = MagiaTimelineGUI.runTimelineAttempt(remuxConfig, schema, tempDirPath)
-                if failure is None:
-                    print("[Info] MagiaTimeline worker process finished successfully after remux fallback.")
-                    return
-                print("[Error] Remuxed video processing failed:\n" + failure)
-            else:
-                print("[Error] ffmpeg remux failed:\n" + remuxResult.stdout)
-
-            print("[Info] Attempt 3/3: re-encoding video, preferring GPU acceleration when available.")
-            encoder = detect_h264_encoder()
-            print(f"[Info] Selected ffmpeg H.264 encoder: {encoder}")
-            reencodeCommand = build_reencode_command(str(originalSource), str(paths.reencoded), encoder)
-            reencodeResult = run_ffmpeg(reencodeCommand)
-            if reencodeResult.returncode != 0 and encoder != "libx264":
-                print("[Error] GPU re-encode failed; retrying CPU libx264:\n" + reencodeResult.stdout)
-                encoder = "libx264"
-                reencodeCommand = build_reencode_command(str(originalSource), str(paths.reencoded), encoder)
-                reencodeResult = run_ffmpeg(reencodeCommand)
-            if reencodeResult.returncode != 0:
-                print("[Error] ffmpeg re-encode failed:\n" + reencodeResult.stdout)
-                print("[Error] All processing attempts failed.")
-                return
-
-            reencodeConfig = copy.deepcopy(originalConfig)
-            reencodeConfig["source"] = [str(paths.reencoded)]
-            reencodeConfig["destination"] = [str(paths.reencoded_destination)]
-            print(f"[Info] Re-encoded video written to {paths.reencoded}")
-            print(f"[Info] Re-encoded subtitle output prefix: {paths.reencoded_destination}")
-            failure = MagiaTimelineGUI.runTimelineAttempt(reencodeConfig, schema, tempDirPath)
-            if failure is None:
-                print("[Info] MagiaTimeline worker process finished successfully after re-encode fallback.")
-                return
-            print("[Error] Re-encoded video processing failed:\n" + failure)
-            print("[Error] All processing attempts failed.")
+            import MagiaTimeline
+            MagiaTimeline.main(*args, **kwargs)
+            print(f"[Info] MagiaTimeline worker process finished successfully.")
         except Exception:
-            print("[Error] Unhandled exception in MagiaTimeline worker process:\n" + traceback.format_exc())
+            tb = traceback.format_exc()
+            print("[Error] Unhandled exception in MagiaTimeline worker process:\n" + tb)
         finally:
             sys.stdout = sys.__stdout__
             sys.stderr = sys.__stderr__
@@ -529,11 +446,14 @@ class MagiaTimelineGUI(customtkinter.CTk):
         config["source"] = [self.player.path]
         config["destination"] = ["..."]
         config["dtd"]["default"]["dialogRect"] = [lw, rw, th, bh]
-        config["extraJobs"] = []
+        extraJobs = []
+        if self.checkboxTextExtraction.get():
+            extraJobs.append("ocr")
+        if self.checkboxStyleClassify.get():
+            extraJobs.append("sty")
+        config["extraJobs"] = extraJobs
         config["dtd"]["default"]["enableTypewriter"] = bool(self.checkboxTypewriter.get())
-        config["outputFormat"] = "srt"
-        if "framewise" in config:
-            config["framewise"]["debug"] = False
+        config["outputSrt"] = bool(self.checkboxOutputSrt.get())
 
         self.writeConsole("[Info] Starting process...\n")
         self.writeConsole(f"[Trace] dialogRect: [{lw:.3f}, {rw:.3f}, {th:.3f}, {bh:.3f}]\n")
