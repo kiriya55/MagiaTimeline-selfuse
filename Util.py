@@ -15,9 +15,11 @@ import lz4
 import concurrent.futures
 import os
 import warnings
+import dataclasses
+import paddleocr
 
 class CompressedDisk(diskcache.Disk):
-    """Cache key and value using zlib compression."""
+    """Cache key and value using lz4 compression."""
 
     def __init__(self, directory, compress_level=4, **kwargs):
         self.compress_level = compress_level
@@ -61,13 +63,17 @@ def initDiskCache(tempDirPath: typing.Optional[str] = None):
     # If not, create a temporary directory that will be cleaned up automatically.
     global _tempLock, _tempDir, _tempDirPath, _diskCache, _threadPool
 
-    @atexit.register
+    if _diskCache is not None:
+        return
+
     def _cleanupCache():
         _threadPool.shutdown(wait=True)
         if _diskCache is not None:
             _diskCache.close()
         if _tempDir is not None:
             _tempDir.cleanup()
+
+    atexit.register(_cleanupCache)
 
     with _tempLock:
         # Initialize the temporary directory
@@ -133,6 +139,7 @@ def containsLargeNdarray(obj: typing.Any) -> bool:
 
 def formatTimestamp(timeBase: fractions.Fraction, timestamp: int) -> str:
     dTimestamp = datetime.datetime.fromtimestamp(float(timestamp * timeBase), datetime.timezone(datetime.timedelta()))
+    # strftime("%f") produces 6-digit microseconds; [:-3] trims to milliseconds; [:-1] trims to centiseconds for ASS format
     timeStr = dTimestamp.strftime("%H:%M:%S.%f")[:-3]
     return timeStr[:-1]
 
@@ -217,19 +224,19 @@ def phaseCorrelateMaxRes(
 
 def morphologyWeightUpperBound(image: cv.Mat, erodeWeight: int, dilateWeight: int) -> cv.Mat:
     imageErode = cv.morphologyEx(image, cv.MORPH_ERODE, kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE, (erodeWeight, erodeWeight)))
-    imageErodeDialate = cv.morphologyEx(imageErode, cv.MORPH_DILATE, kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE, (dilateWeight, dilateWeight)))
-    imageWeightUpperBound = cv.bitwise_and(image, cv.bitwise_not(imageErodeDialate))
+    imageErodeDilate = cv.morphologyEx(imageErode, cv.MORPH_DILATE, kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE, (dilateWeight, dilateWeight)))
+    imageWeightUpperBound = cv.bitwise_and(image, cv.bitwise_not(imageErodeDilate))
     return imageWeightUpperBound
 
 def morphologyWeightLowerBound(image: cv.Mat, erodeWeight: int, dilateWeight: int) -> cv.Mat:
     imageErode = cv.morphologyEx(image, cv.MORPH_ERODE, kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE, (erodeWeight, erodeWeight)))
-    imageErodeDialate = cv.morphologyEx(imageErode, cv.MORPH_DILATE, kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE, (dilateWeight, dilateWeight)))
-    imageWeightLowerBound = cv.bitwise_and(image, imageErodeDialate)
+    imageErodeDilate = cv.morphologyEx(imageErode, cv.MORPH_DILATE, kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE, (dilateWeight, dilateWeight)))
+    imageWeightLowerBound = cv.bitwise_and(image, imageErodeDilate)
     return imageWeightLowerBound
 
-def morphologyNear(base: cv.Mat, ref: cv.Mat, Weight: int) -> cv.Mat:
-    refDialate = cv.morphologyEx(ref, cv.MORPH_DILATE, kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE, (Weight, Weight)))
-    return cv.bitwise_and(base, refDialate)
+def morphologyNear(base: cv.Mat, ref: cv.Mat, weight: int) -> cv.Mat:
+    refDilate = cv.morphologyEx(ref, cv.MORPH_DILATE, kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE, (weight, weight)))
+    return cv.bitwise_and(base, refDilate)
 
 def avFrame2CvMat(frame: av.frame.Frame, scaleDown: int) -> cv.Mat:
     image = frame.to_ndarray(format='bgr24')
@@ -269,9 +276,18 @@ def autoNumberedNaming(srcPath: str) -> str:
         if not conflictExists:
             return targetPrefix
         
-        suffix = chr(ord(suffix) + 1)
-        if suffix > 'z':
+        suffix = nextSuffix(suffix)
+        if len(suffix) > 4:
             raise Exception("Too many files with the same base name, please clean up the directory.")
+
+def nextSuffix(s: str) -> str:
+    """Increment alphabetic suffix: a->b->...->z->aa->ab->...->az->ba->...->zz->aaa"""
+    if not s:
+        return 'a'
+    if s[-1] < 'z':
+        return s[:-1] + chr(ord(s[-1]) + 1)
+    else:
+        return nextSuffix(s[:-1]) + 'a'
 
 def checkerboardBackground(width: int, height: int, squareSize: int = 8) -> cv.Mat:
     """Generate a BGR checkerboard image resembling Photoshop's transparency background.
@@ -282,6 +298,83 @@ def checkerboardBackground(width: int, height: int, squareSize: int = 8) -> cv.M
     channel = np.where(checker, 128, 192).astype(np.uint8)
     img = np.stack([channel, channel, channel], axis=2)
     return typing.cast(cv.Mat, img)
+
+@dataclasses.dataclass
+class TextDetectionResult:
+    """Result of a text detection pass including the raw probability map."""
+    boxes: list  # list of dt_polys (numpy arrays of polygon vertices)
+    scores: list  # list of float confidence scores
+    probabilityMap: np.ndarray  # float32, same size as input frame
+
+class PaddleTextDetectionAdapter:
+    """Wraps a paddleocr.TextDetection instance to expose text detection results.
+
+    Extracts raw probability map via runner.infer() API.
+    Requires paddleocr 3.7.0 (runner.infer path).
+
+    Usage:
+        ocr = paddleocr.TextDetection(...)
+        adapter = PaddleTextDetectionAdapter(ocr)
+        result = adapter.detect(frame)
+        # result.boxes, result.scores, result.probabilityMap
+    """
+
+    def __init__(self, text_detection: paddleocr.TextDetection) -> None:
+        assert hasattr(text_detection, "paddlex_predictor"), (
+            "paddleocr.TextDetection missing 'paddlex_predictor' attribute. "
+            "Check paddleocr version compatibility."
+        )
+        self.predictor = text_detection.paddlex_predictor
+        p = self.predictor
+        assert hasattr(p, "pre_tfs"), "PaddleX predictor missing 'pre_tfs'"
+        assert hasattr(p, "post_op"), "PaddleX predictor missing 'post_op'"
+        assert hasattr(p, "runner") and hasattr(p.runner, "infer"), (
+            "PaddleX predictor missing 'runner.infer'. "
+            "Probability map extraction requires runner.infer API."
+        )
+
+    def detect(self, frame: np.ndarray) -> TextDetectionResult:
+        """Run text detection on a single frame.
+
+        Returns TextDetectionResult with boxes, scores, and probabilityMap.
+        Always extracts probability map via runner.infer().
+        """
+        p = self.predictor
+
+        batch_raw_imgs = p.pre_tfs["Read"](imgs=[frame])
+        batch_imgs, batch_shapes = p.pre_tfs["Resize"](
+            imgs=batch_raw_imgs,
+            limit_side_len=p.limit_side_len,
+            limit_type=p.limit_type,
+            max_side_limit=p.max_side_limit,
+        )
+        batch_imgs = p.pre_tfs["Normalize"](imgs=batch_imgs)
+        batch_imgs = p.pre_tfs["ToCHW"](imgs=batch_imgs)
+        x = p.pre_tfs["ToBatch"](imgs=batch_imgs)
+
+        preds = p.runner.infer(x=x)
+
+        polys, scores = p.post_op(
+            preds,
+            batch_shapes,
+            thresh=p.thresh,
+            box_thresh=p.box_thresh,
+            unclip_ratio=p.unclip_ratio,
+        )
+
+        prob_map = preds[0][0, 0]
+        src_h, src_w, _, _ = batch_shapes[0]
+        prob_map_resized = cv.resize(
+            prob_map,
+            (int(src_w), int(src_h)),
+            interpolation=cv.INTER_LINEAR,
+        )
+
+        return TextDetectionResult(
+            boxes=polys[0],
+            scores=scores[0],
+            probabilityMap=prob_map_resized,
+        )
 
 def suppressPaddleWarnings():
     warnings.filterwarnings(
