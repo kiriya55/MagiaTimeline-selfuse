@@ -309,8 +309,7 @@ class TextDetectionResult:
 class PaddleTextDetectionAdapter:
     """Wraps a paddleocr.TextDetection instance to expose text detection results.
 
-    Extracts raw probability map via runner.infer() API.
-    Requires paddleocr 3.7.0 (runner.infer path).
+    Extracts raw probability map via PaddleX inference APIs.
 
     Usage:
         ocr = paddleocr.TextDetection(...)
@@ -328,16 +327,17 @@ class PaddleTextDetectionAdapter:
         p = self.predictor
         assert hasattr(p, "pre_tfs"), "PaddleX predictor missing 'pre_tfs'"
         assert hasattr(p, "post_op"), "PaddleX predictor missing 'post_op'"
-        assert hasattr(p, "runner") and hasattr(p.runner, "infer"), (
-            "PaddleX predictor missing 'runner.infer'. "
-            "Probability map extraction requires runner.infer API."
-        )
+        self._infer = None
+        if hasattr(p, "runner") and hasattr(p.runner, "infer"):
+            self._infer = p.runner.infer
+        elif hasattr(p, "infer"):
+            self._infer = p.infer
+        assert self._infer is not None, "PaddleX predictor missing an inference API."
 
     def detect(self, frame: np.ndarray) -> TextDetectionResult:
         """Run text detection on a single frame.
 
         Returns TextDetectionResult with boxes, scores, and probabilityMap.
-        Always extracts probability map via runner.infer().
         """
         p = self.predictor
 
@@ -352,7 +352,7 @@ class PaddleTextDetectionAdapter:
         batch_imgs = p.pre_tfs["ToCHW"](imgs=batch_imgs)
         x = p.pre_tfs["ToBatch"](imgs=batch_imgs)
 
-        preds = p.runner.infer(x=x)
+        preds = self._infer(x=x)
 
         polys, scores = p.post_op(
             preds,
